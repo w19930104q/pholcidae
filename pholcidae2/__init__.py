@@ -92,7 +92,10 @@ class Pholcidae(object):
 
         # adding start point into storage
         start_url = '%(protocol)s%(domain)s%(start_page)s' % self._settings
-        self._storage.add(start_url.strip(), SyncStorage.PRIORITY_LOW)
+        start_url = start_url.strip()
+        start_hash = start_url if not self._settings['hashed'] \
+            else sha1(start_url.encode('utf-8')).hexdigest()[:6]
+        self._storage.add(start_url, start_hash, SyncStorage.PRIORITY_LOW)
 
         # creating HTTP opener instance
         handlers = []
@@ -272,11 +275,24 @@ class Fetcher(Thread):
             pass
 
         if response:
-            page['body'] = str(response.read())
+            body = response.read()
+            if not isinstance(body, str):
+                # Python 3 returns bytes, decode them into real text
+                body = body.decode('utf-8', 'replace')
+            page['body'] = body
 
             # gather page data and call callback function if not silent
             if not self._is_silent(self._url):
                 headers = {h[0]: h[1] for h in response.headers.items()}
+
+                # keep every Set-Cookie header, not only the last one
+                set_cookies = None
+                if hasattr(response.headers, 'get_all'):
+                    set_cookies = response.headers.get_all('Set-Cookie')
+                elif hasattr(response.headers, 'getheaders'):
+                    set_cookies = response.headers.getheaders('Set-Cookie')
+                if set_cookies:
+                    headers['Set-Cookie'] = set_cookies
 
                 page.update({
                     'headers': headers,
@@ -328,8 +344,11 @@ class Fetcher(Thread):
             link = parse.urljoin(self._url, link)
             link = link.strip()
 
+            link_hash = link if not self._settings['hashed'] \
+                else sha1(link.encode('utf-8')).hexdigest()[:6]
+
             # pass if already parsed
-            if self._storage.is_parsed(link):
+            if self._storage.is_parsed(link_hash):
                 continue
 
             # trying to extract links only from valid set of pages MIME types
@@ -355,8 +374,6 @@ class Fetcher(Thread):
             # set highest priority if link matches any regex from "valid_links" list
             if self._is_valid(link):
                 priority = SyncStorage.PRIORITY_HIGH
-
-            link_hash = link if not self._settings['hashed'] else sha1(link.encode('utf-8')).hexdigest()[:6]
 
             # locking
             with self._lock:
@@ -414,13 +431,17 @@ class Fetcher(Thread):
 class Cookies(object):
     """ Handles HTTP cookies parsing """
 
-    # unnecessary cookie fields
+    # cookie attribute names, not real cookies
     __meta_fields = [
         'expires',
         'path',
         'domain',
         'secure',
-        'HttpOnly'
+        'httponly',
+        'max-age',
+        'samesite',
+        'version',
+        'comment',
     ]
 
     @staticmethod
@@ -431,14 +452,48 @@ class Cookies(object):
         """
 
         cookies = {}
-        if 'Set-Cookie' in headers:
-            # splitting raw cookies
-            raw_cookies = headers['Set-Cookie'].split(';')
-            for cookie in raw_cookies:
-                cookie = cookie.split('=')
-                if cookie[0].strip() not in Cookies.__meta_fields and len(cookie) > 1:
-                    cookies.update({cookie[0]: cookie[1]})
+        if 'Set-Cookie' not in headers:
+            return cookies
+
+        raw_headers = headers['Set-Cookie']
+        if not isinstance(raw_headers, (list, tuple)):
+            raw_headers = [raw_headers]
+
+        for raw_header in raw_headers:
+            for part in Cookies.__split_header(raw_header):
+                name, separator, value = part.partition('=')
+                name = name.strip()
+                # skip bare flags and cookie attributes
+                if not separator or name.lower() in Cookies.__meta_fields:
+                    continue
+                value = value.strip()
+                # unquote value if it is double-quoted
+                if len(value) > 1 and value.startswith('"') and value.endswith('"'):
+                    value = value[1:-1]
+                cookies[name] = value
         return cookies
+
+    @staticmethod
+    def __split_header(header):
+
+        """
+        Splits Set-Cookie header on semicolons, ignoring
+        semicolons inside double-quoted values.
+        """
+
+        parts = []
+        buf = []
+        in_quotes = False
+        for char in header:
+            if char == '"':
+                in_quotes = not in_quotes
+            elif char == ';' and not in_quotes:
+                parts.append(''.join(buf))
+                buf = []
+                continue
+            buf.append(char)
+        parts.append(''.join(buf))
+        return parts
 
 
 class SyncStorage(object):
